@@ -1,0 +1,887 @@
+---
+title: "Simulation with covariates"
+author: "Josh Zitovsky"
+date: "2/8/2019"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=10, fig.height=4.5) 
+```
+
+
+```{r, echo=F, results='hide', warning=FALSE, message=FALSE}
+#data processing
+library(tidyverse)
+library(apeglm)
+library(emdbook)
+library(ashr)
+data = read_csv("~/Downloads/fullGeccoRnaDump.csv")
+dim(data)
+head(data,100)
+
+#counting total allele-specific (AS) reads, turning relevant columns numeric
+data2 = data %>%
+  transform(ASE_mat=as.numeric(ASE_mat), ASE_pat=as.numeric(ASE_pat)) %>%
+  mutate(group = substr(sample_id,1,2), ASE_tot=ASE_mat+ASE_pat) %>%
+  filter(!(group %in% c("FF","GG","HH")))
+head(data2, 100)
+
+#getting gene by sample matrix of total allele counts
+select=dplyr::select
+cts = data2 %>%
+  select(ensembl_id, sample_id, ASE_tot) %>%
+  spread(sample_id, ASE_tot) 
+head(cts)
+
+#getting gene by sample matrix of paternal allele counts
+ase.cts = data2 %>%
+  select(ensembl_id, sample_id, ASE_pat) %>%
+  spread(sample_id, ASE_pat) 
+head(ase.cts)
+
+#removing genes with low total allele counts
+goodSamples = function(x) {
+  return(sum(x>=10))
+}
+
+largeSamples = cts %>%
+  select(-ensembl_id) %>%
+  apply(1, goodSamples)
+
+keepGenes = cts$ensembl_id[largeSamples>=3]           #only keep genes if at least three samples have AS counts of 10+ 
+ase.cts = filter(ase.cts, ensembl_id %in% keepGenes)  
+cts = filter(cts, ensembl_id %in% keepGenes)
+
+#counting total AS counts and total paternal counts for each gene
+cts$total = rowSums(cts[,-1])     
+ase.cts$total = rowSums(ase.cts[,-1])
+head(ase.cts)
+head(cts)
+
+#sample probabilities
+sampleProbs = ase.cts$total/cts$total
+summary(sampleProbs)
+#gene 11834, ENSMUSG00000064377, is the only gene with 0 expression, with 106 out of 106 from father. We will cap estimated probability at the second empirical lowest (with >1000 counts), 0.0007 (1 out of 1429). Median AS counts is 15547, 1st quartile is 3769. 
+```
+
+
+```{r, echo=F, results='hide'}
+#creating functions
+#function to get AS reads from inputted cross pair
+processCts = function(groupInp , data2, groupInp2) { #groupInp is the first cross, #groupInp2 is the second cross
+  data3 = data2 %>%
+    filter(group==groupInp | group==groupInp2) %>%                  #only keep samples from inputted cross pair
+    transform(ASE_pat = ifelse(group==groupInp2, ASE_mat, ASE_pat)) #the second cross swaps which strain is the mother and which is the father, and thus ASE_pat and ASE_mat must be switched 
+  
+  #gene x samples matrix of reads from second strain specifically
+  ase.cts2 = data3 %>%                                              
+    select(ensembl_id, sample_id, ASE_pat) %>%
+     spread(sample_id, ASE_pat) 
+  
+  #gene x samples matrix of total allele-specific reads
+  cts2 = data3 %>%
+    select(ensembl_id, sample_id, ASE_tot) %>%
+     spread(sample_id, ASE_tot)
+  
+  #filtering out genes with very low numbers of AS reads
+  largeSamples = cts2 %>%
+    select(-ensembl_id) %>%
+    apply(1, goodSamples)
+  keepGenes = cts2$ensembl_id[largeSamples>=3]
+  ase.cts2 = filter(ase.cts2, ensembl_id %in% keepGenes)
+  cts2 = filter(cts2, ensembl_id %in% keepGenes)
+  
+  #calculating sample proportions of reads mapped to second strain
+  cts2$total = rowSums(cts2[,-1])
+  ase.cts2$total = rowSums(ase.cts2[,-1])
+  sampleProbs = ase.cts2$total/cts2$total
+  
+  return(list(probs=sampleProbs, counts=cts2, allelecounts=ase.cts2))
+}
+
+
+
+
+#function that computes MLE and MAP estimates from the data processed above 
+tooLazyToComeUpWithAGoodTitleForFunction = function(p) {
+  cts=p$counts                           
+  ase.cts=p$allelecounts
+  cts$total=cts$ensembl_id=NULL
+  ase.cts$total=ase.cts$ensembl_id=NULL
+  cts=as.matrix(cts)
+  ase.cts=as.matrix(ase.cts)
+  X=matrix(rep(1,ncol(cts)))
+  theta.hat.0 <- 100 # rough estimate of dispersion
+  param <- cbind(theta.hat.0, cts)
+  
+    fit.mle <- apeglm(tol=1e-14, Y=ase.cts, x=X,
+                      log.lik=NULL,
+                      param=param,
+                      no.shrink=TRUE,
+                      log.link=FALSE,
+                      method="betabinCR",
+                      cap=0.0007)
+  
+  theta.hat <- bbEstDisp(success=ase.cts, size=cts,
+                         x=X, beta=fit.mle$map,
+                         minDisp=1, maxDisp=500)
+  
+  coef <- 1
+  mle <- cbind(fit.mle$map, fit.mle$sd)
+  param <- cbind(theta.hat, cts)
+    fit.map <- apeglm(tol=1e-14, Y=ase.cts, x=X,
+                   log.lik=NULL,
+                   param=param,
+                   coef=1,
+                   mle=mle,
+                   threshold=0.5,
+                   log.link=FALSE,
+                   method = "betabinCR",
+                   interceptAction = "SHRINKINTERCEPT?!!!",
+                   cap=0.0007)
+  return(list(mle=fit.mle,map=fit.map, counts=cts, theta=theta.hat))
+}
+
+
+
+
+#repeating the same thing as above, except this time removing genes with sample allelic proportions of 0 and 1
+processCts2 = function(groupInp, data2, groupInp2) {
+data3 = data2 %>%
+  filter(group==groupInp | group==groupInp2) %>%
+  transform(ASE_pat = ifelse(group==groupInp2, ASE_mat, ASE_pat))
+
+ase.cts2 = data3 %>%
+  select(ensembl_id, sample_id, ASE_pat) %>%
+   spread(sample_id, ASE_pat) 
+
+cts2 = data3 %>%
+  select(ensembl_id, sample_id, ASE_tot) %>%
+   spread(sample_id, ASE_tot)
+
+largeSamples = cts2 %>%
+  select(-ensembl_id) %>%
+  apply(1, goodSamples)
+
+keepGenes = cts2$ensembl_id[largeSamples>=3]
+
+ase.cts2 = filter(ase.cts2, ensembl_id %in% keepGenes)
+cts2 = filter(cts2, ensembl_id %in% keepGenes)
+cts2$total = rowSums(cts2[,-1])
+ase.cts2$total = rowSums(ase.cts2[,-1])
+remove2 = ase.cts2$total>=1 & ase.cts2$total<=cts2$total-1           #keep genes with at least one count for both alleles
+cts2 = cts2[remove2,]
+ase.cts2 = ase.cts2[remove2,]
+sampleProbs = ase.cts2$total/cts2$total
+
+return(list(probs=sampleProbs, counts=cts2, allelecounts=ase.cts2))
+}
+
+
+
+#function that gets mean absolute error and median absolute deviation
+getMAE = function(goal, mle, map, ash, int) {
+return(list(MAEmle = mean(abs(goal[int]-mle[int])),
+           MAEmap = mean(abs(goal[int]-map[int])),
+           MAEash = mean(abs(goal[int]-ash[int]))))
+}
+
+getMAD = function(goal, mle, map, ash, int) {
+return(list(MADmle = median(abs(goal[int]-mle[int])),
+           MADmap = median(abs(goal[int]-map[int])),
+           MADash = median(abs(goal[int]-ash[int]))))
+}
+
+
+
+
+#function for simulating data and fitting models, with inputted beta, overdispersion and subset
+processSimulation = function(seedd, sub, beta, phi=l$theta) {
+set.seed(seedd)
+counts = p$counts[,sub]
+counts = as.matrix(counts)
+rownames(counts) <- seq(length=nrow(counts)) #reseting row names 
+x = rep(c(0,1),length(sub)/2)
+logit = matrix(nrow = length(alleleProbs), ncol = length(sub))
+for (i in 1:length(alleleProbs)) logit[i,] = alleleProbs[i] + beta[i]*x #simlated probs for samples of the ith gene 
+probs = 1/(1+exp(-logit))
+
+simulatedACounts1 = rbetabinom(n = prod(dim(counts)), 
+                               prob = t(probs), 
+                               size = t(counts), 
+                               theta = rep(phi, each=length(sub)))
+simulatedACounts1 = matrix(simulatedACounts1, nrow=nrow(counts), byrow=T)
+
+#fitting MLE, MAP and ash models
+cts = counts
+ase.cts = simulatedACounts1
+X=matrix(c(rep(1,ncol(cts)), x), ncol=2)
+theta.hat.0 <- 100 
+param <- cbind(theta.hat.0, cts)
+
+#initial MLE fit  
+fit.mle <- apeglm(tol=1e-14, Y=ase.cts, x=X,                    
+                  log.lik=NULL,
+                  param=param,
+                  no.shrink=TRUE,
+                  log.link=FALSE,
+                  method="betabinCR",
+                  cap=0.001)
+
+#using initial MLE to estimate overdispersion
+theta.hat <- bbEstDisp(success=ase.cts, size=cts,
+                     x=X, beta=fit.mle$map,
+                     minDisp=1, maxDisp=500)
+
+#re-fitting MLE with estmated overdispersion
+param <- cbind(theta.hat, cts)
+fit.mle <- apeglm(tol=1e-14, Y=ase.cts, 
+                  x=X,
+                  log.lik=NULL,
+                  param=param,
+                  no.shrink=TRUE,
+                  log.link=FALSE,
+                  method="betabinCR",
+                  coef=1,
+                  interceptAction = "SHRINKINTERCEPT?!!!",
+                  cap=0.001)
+
+#fitting shrinkage model
+mle <- cbind(fit.mle$map[,2], fit.mle$sd[,2])
+fit.map <- apeglm(tol=1e-14, Y=ase.cts, 
+                  x=X,
+                  log.lik=NULL,
+                  param=param,
+                  coef=2,
+                  mle=mle,
+                  threshold=0.5,
+                  log.link=FALSE,
+                  method = "betabinCR",
+                  cap=0.0007)
+
+#fitting ash model
+fit.ash = ash(as.vector(fit.mle$map[,2]), as.vector(fit.mle$sd[,2]), method = "shrink")
+
+return(list(truth=beta, mle = fit.mle$map[,2], map=fit.map$map[,2], ashe = fit.ash$result$PosteriorMean, mlesd=fit.mle$sd[,2], mapsd=fit.map$sd[,2], ashsd = fit.ash$result$PosteriorSD, cts = cts, ase.cts=ase.cts))
+}
+
+
+
+
+#function for generating MA plots and estimate vs. true plots
+getPlots = function(truth, mle, map, ashe = NULL, includeAsh = FALSE, mle.filter = NULL, rule=NULL, includeFilter = FALSE) {
+#true vs estimate plots
+plot(mle ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MLE")
+plot(map ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MAP")
+if (includeAsh==TRUE) plot(ashe ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, ash")
+if (includeFilter==TRUE) { plot(mle.filter[rule] ~ truth[rule], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, filter MLE") }
+
+#looking at small and large effects separately
+if (includeFilter==FALSE) {
+plot(mle[abs(mle)<4 & abs(truth)<4] ~ truth[abs(mle)<4 & abs(truth)<4], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MLE, y-range between -4 and 4")
+plot(map[abs(mle)<4 & abs(truth)<4] ~ truth[abs(mle)<4 & abs(truth)<4], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MAP, y-range between -4 and 4")
+if (includeAsh==TRUE) plot(ashe[abs(mle)<4 & abs(truth)<4] ~ truth[abs(mle)<4 & abs(truth)<4], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, ash, y-range between -4 and 4")
+#if (includeFilter==TRUE) { plot(mle.filter[abs(mle)<4 & abs(truth)<4 & rule] ~ truth[abs(mle)<4 & abs(truth)<4 & rule], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, filter MLE, y-range between -4 and 4") }
+
+plot(mle[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MLE, large estimates only (absolute value of MLE >4)")
+plot(map[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MAP, large MLE only (absolute value of MLE >4)")
+if (includeAsh==TRUE) { plot(ashe[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, ash, large estimates only (absolute value of MLE >4)")}
+#if (includeFilter==TRUE) { plot(mle.filter[abs(mle)<4 & abs(truth)<4 & rule] ~ truth[abs(mle)<4 & abs(truth)<4 & rule], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, filter MLE, y-range between -4 and 4") }
+
+
+#MA plots - estimate vs. mean counts (counts on log scale)
+totalCounts = rowSums(cts)
+logCounts = log(totalCounts)
+maxC =  quantile(totalCounts, probs=0.99)        
+maxC2 =  quantile(totalCounts, probs=0.9)         
+maxE = quantile(abs(mle), probs=0.99)             
+maxE2 = quantile(abs(mle), probs=0.9)             
+cond1 = logCounts>=2 & abs(mle)<maxE         
+cond2 = totalCounts<maxC & logCounts>=2 & abs(mle)<maxE2  
+cond3 = logCounts>=2 & totalCounts<500 & cond1
+
+plot(mle ~ logCounts, ylim=c(-7,7)); title(main="MLE vs. log of counts (for both alleles)")
+plot(map ~ logCounts, ylim=c(-7,7)); title(main="MAP vs. log of counts (for both alleles)")
+if (includeAsh==TRUE) plot(ashe ~ logCounts, ylim=c(-7,7)); title(main="ash vs. log of counts (for both alleles)")
+if (includeFilter==TRUE) { plot(mle.filter[rule] ~ logCounts[rule], ylim=c(-7,7)); title(main="filter MLE vs. log of counts (for both alleles)") }
+
+#MA plots with restricted range for effect size (top 1% removed)
+plot(mle[cond1] ~ logCounts[cond1], ylim=c(-maxE, maxE)); title(main="MLE vs. log of counts (for both alleles), 1% largest MLEs removed")
+plot(map[cond1] ~ logCounts[cond1], ylim=c(-maxE, maxE)); title(main="MAP vs. log of counts (for both alleles), 1% largest MLEs removed")
+if (includeAsh==TRUE) plot(ashe[cond1] ~ logCounts[cond1], ylim=c(-maxE, maxE)); title(main="ash vs. log of counts (for both alleles), 1% largest MLEs removed")
+# if (includeFilter==TRUE) { plot(mle.filter[cond1 & rule] ~ logCounts[cond1 & rule], ylim=c(-maxE, maxE)); title(main="filter MLE vs. log of counts (for both alleles), 1% largest MLEs removed") }
+
+#MA plots with restricted range for count size and more restricted range for effect size (top 1% and top 10% removed, respectively)
+plot(mle[cond2] ~ logCounts[cond2], ylim=c(-maxE2, maxE2)); title(main="MLE vs. log of counts (for both alleles), 10% largest MLEs and 1% largest counts removed")
+plot(map[cond2] ~ logCounts[cond2], ylim=c(-maxE2, maxE2)); title(main="MAP vs. log of counts (for both alleles), 10% largest MLEs and 1% largest counts removed")
+if (includeAsh==TRUE) plot(ashe[cond2] ~ logCounts[cond2], ylim=c(-maxE2, maxE2)); title(main="ash vs. log of counts (for both alleles), 10% largest MLEs and 1% largest counts removed")
+# if (includeFilter==TRUE) { plot(mle.filter[cond2 & rule] ~ logCounts[cond2 & rule], ylim=c(-maxE2, maxE2)); title(main="filter MLE vs. log of counts (for both alleles), 10% largest MLEs and 1% largest counts removed") }
+
+#MA plots with only <500 counts and lower 99% of effect sizes includes
+plot(mle[cond3] ~ logCounts[cond3], ylim=c(-maxE, maxE)); title(main="MLE vs. log of counts (for both alleles), <500 counts and lower 99% of MLEs only")
+plot(map[cond3] ~ logCounts[cond3], ylim=c(-maxE, maxE)); title(main="MAP vs. log of counts (for both alleles), <500 counts and lower 99% of MLEs only")
+if (includeAsh==TRUE) plot(ashe[cond3] ~ logCounts[cond3], ylim=c(-maxE, maxE)); title(main="ash vs. log of counts (for both alleles), <500 counts and lower 99% of MLEs only")
+}
+}
+
+
+
+
+#function to make CAT plot
+plotCat = function(truth,mle,map,ashe) {
+#getting top genes according to each estimate (concordance matrix)
+lfcs = data.frame(truth, mle, map, ashe)
+tops = c(10,20,50,100,200,300,400,500)
+mat = matrix(0, nrow = length(tops), ncol = 4)
+for (i in 1:length(tops)) {
+  for (j in 1:4) {
+    mat[i,j] = length(intersect(order(-abs(lfcs$truth))[1:tops[i]],
+                          order(-abs(lfcs[,j]))[1:tops[i]]))/tops[i]
+  }
+}
+concWide = as.data.frame(mat)
+colnames(concWide) = c("truth","mle","map","ashe")
+concWide = cbind(concWide,tops)
+conc = gather(concWide, estimate, concordance, truth:ashe, factor_key=TRUE)
+
+
+#plotting CAT (concordance at top gene)
+cat = ggplot(conc, mapping = aes(x=tops, y=concordance, group=estimate)) +
+  geom_point(aes(color=estimate)) +
+  geom_line(aes(color=estimate)) + 
+  ggtitle(label = "CAT PLOT") + 
+  theme(plot.title = element_text(hjust = 0.5)) + #centers title
+  xlab(label = "number of top genes") 
+return(list(plot=cat, data=conc))
+}
+
+
+
+#get boolean vector indicating which genes have at least a certain number of counts for at least a certain number of samples
+filterIt = function(p, samples, counts) {
+goodSamples2 = function(x) {
+  return(sum(x>=counts))
+}
+
+largeSamples = p$counts %>%
+  select(-c(ensembl_id, total)) %>%
+  apply(1, goodSamples2)
+keepGenes = largeSamples>=samples
+return(keepGenes)
+}
+
+
+
+#plots the effectiveness of different filtering rules (based on input) wrt MLE concordance
+getFilterRule = function(sub, beta, samples, max=200, all=FALSE, load=TRUE, desc) {
+avg = vector("double", length(seq(0,max,by=10)))
+#top10 = vector("double", length(seq(0,200,by=20)))
+#top50 = vector("double", length(seq(0,200,by=20)))
+#top100 = vector("double", length(seq(0,200,by=20)))
+#top500 = vector("double", length(seq(0,200,by=20)))
+j=1
+pSub=list(counts=p$counts[,c(1,sub,26)], allelecounts=p$allelecounts[,c(1,sub,26)])
+for (i in seq(0,max,by=10)) {
+  if (all==FALSE) {
+    rule = filterIt(pSub, samples, i)
+  } else {
+    rule = pSub$counts$total>i
+  }
+  mle.filter = ifelse(rule, mle, 0)
+  conc = plotCat(truth, mle.filter, map, ashe)$data
+  avg[j] = mean(conc$concordance[conc$estimate=="mle"])
+#  top10[j] = conc$concordance[conc$estimate=="mle" & conc$tops==10]
+#  top50[j] = conc$concordance[conc$estimate=="mle" & conc$tops==50]
+#  top100[j] = conc$concordance[conc$estimate=="mle" & conc$tops==100]
+#  top500[j] = conc$concordance[conc$estimate=="mle" & conc$tops==500]
+  j=j+1
+  if (load==TRUE) print(i)
+}
+mat = cbind(avg, (1:length(avg)-1)*10)
+plot(mat[,1] ~ mat[,2], 
+     main="average MLE concordance vs. filtering rule", 
+     xlab=desc, 
+     ylab="average MLE concordance")
+lines(x=mat[,2], y=mat[,1])
+#best at 120
+}
+
+
+
+#function to make CAT plot with mle.filter
+plotCatF = function(truth,mle,map,ashe, mle.filter) {
+#getting top genes according to each estimate (concordance matrix)
+lfcs = data.frame(truth, mle, map, ashe, mle.filter)
+tops = c(10,20,50,100,200,300,400,500)
+mat = matrix(0, nrow = length(tops), ncol = 5)
+for (i in 1:length(tops)) {
+  for (j in 1:5) {
+    mat[i,j] = length(intersect(order(-abs(lfcs$truth))[1:tops[i]],
+                          order(-abs(lfcs[,j]))[1:tops[i]]))/tops[i]
+  }
+}
+concWide = as.data.frame(mat)
+colnames(concWide) = c("truth","mle","map","ashe", "mle.filter")
+concWide = cbind(concWide,tops)
+conc = gather(concWide, estimate, concordance, truth:mle.filter, factor_key=TRUE)
+
+
+#plotting CAT (concordance at top gene)
+cat = ggplot(conc, mapping = aes(x=tops, y=concordance, group=estimate)) +
+  geom_point(aes(color=estimate)) +
+  geom_line(aes(color=estimate)) +
+  ggtitle(label = "CAT plot (mle.filter uses the optimal filtering rule, and estimates other than mle.filter use the full data)") + 
+  xlab(label = "number of top genes")
+return(list(plot=cat, data=conc))
+}
+```
+
+
+```{r, echo=F, results='hide'}
+#removing genes with sex and POE effects
+p=processCts2("FH", data2, "HF")
+cts = p$counts[,-c(1,26)] %>%
+  as.matrix() %>%
+  apply(2,as.numeric)
+ase.cts=as.matrix(p$allelecounts[,-c(1,26)])
+samples = colnames(cts)
+sex = substr(samples, nchar(samples),nchar(samples))
+parentSexes = substr(samples, 1, 2)
+male = ifelse(sex=="M",1, 0)
+motherStrainF = ifelse(parentSexes=="FH",1,0)
+  X=matrix(c(rep(1,ncol(cts)),male,motherStrainF,male*motherStrainF),ncol=4)
+  theta.hat.0 <- 100 
+  param <- cbind(theta.hat.0, cts)
+  fit.mle <- apeglm(tol=1e-14, Y=ase.cts, x=X,
+                    log.lik=NULL,
+                    param=param,
+                    no.shrink=TRUE,
+                    log.link=FALSE,
+                    method="betabinCR",
+                    cap=0.0007)
+  
+  theta.hat <- bbEstDisp(success=ase.cts, size=cts,
+                         x=X, beta=fit.mle$map,
+                         minDisp=1, maxDisp=500)
+  
+  param <- cbind(theta.hat, cts)
+  fit.mle <- apeglm(tol=1e-14, Y=ase.cts, x=X,
+                    log.lik=NULL,
+                    param=param,
+                    no.shrink=TRUE,
+                    log.link=FALSE,
+                    method="betabinCR",
+                    cap=0.0007)
+  
+  significantSex = abs(fit.mle$map[,2])-1.645*fit.mle$sd[,2]>0
+  significantParent = abs(fit.mle$map[,3])-1.645*fit.mle$sd[,3]>0
+  significantInteract = abs(fit.mle$map[,4])-1.645*fit.mle$sd[,4]>0
+  removeGene = ifelse(significantSex+significantParent+significantInteract>0,1,0)
+  p$counts=p$counts[!removeGene,]
+  p$allelecounts=p$allelecounts[!removeGene,]
+  
+  alleleProbs = p$allelecounts$total/p$counts$total
+  l = tooLazyToComeUpWithAGoodTitleForFunction(p)
+```
+
+# simulation - spiked effect
+The population (dataset of interest) is 24 mice, 12 of each sex and 12 of each POE, with the same genetic composition as a result of crossing. Genes where at least three samples do not have 10 count were removed. Genes without at least one count for both alleles were removed. Genes with a significant sex, parent or interaction effect was removed.  
+  
+  
+  
+Our sample size is 4 vs. 4. We select 8 subjects from our dataset, 4 for each sex and 4 for each POE. For the (i,j)th gene-sample in our real (sub)dataset, we simulate $\text{LOGIT}_{ij} = \log\left(\frac{p}{1-p}\right)_{ij} = \alpha_i+\beta_i x$, where $\alpha_i$ is the mean proportion of reads mapped to allele 1 for the ith gene, $\beta_i \sim N(0,1)$ and $x = (0,1,0,...,1)$. Then $p_{ij} = \frac{1}{1+\exp(-\text{LOGIT}_{ij})}$. We then simulate $Y_{ij}$ from $\text{Betabin}(p_{ij}, n_{ij}, \phi_i)$ where $n_{ij}$ is the total reads mapping to both alleles for gene-sample (i,j) and $\phi_i$ is the overdispersion MLE of the ith gene. These will be our simulated allele counts. 
+```{r, echo=F, results='hide'}
+set.seed(2395)
+sub = c(2,3,5,6,14,15,20,21)
+beta = rnorm(nrow(p$counts))
+s = processSimulation(2395, sub, beta)
+
+truth = s$truth
+mle = s$mle
+map = s$map
+ashe = s$ashe
+mlesd = s$mlesd
+mapsd = s$mapsd
+ashsd = s$ashsd
+cts = s$cts
+ase.cts=s$ase.cts
+shrink = abs(map-mle)
+shrinkash = abs(ashe-mle)
+shrunk = abs(map-mle)>0.1
+shrunkash = abs(ashe-mle)>0.1
+improve = abs(truth-mle)-abs(truth-map)
+improveash = abs(truth-mle)-abs(truth-ashe)
+pSub=list(counts=p$counts[,c(1,sub,26)], allelecounts=p$allelecounts[,c(1,sub,26)])
+```
+
+# plots
+
+MAP successfully shrinks erroneously large estimates and improves overall estimation on average. MAP mainly effects estimates with smaller counts. Ash has more extreme shrinkage, and has both more accurate predictions on average and higher concordance with the true top gene list. 
+```{r, echo=F}
+#CAT plots
+plotCat(truth,mle,map,ashe)$plot
+
+#MA and true vs. estimate plots
+getPlots(truth, mle, map, ashe, includeAsh = TRUE)
+```
+
+
+# shrink statistics and plots
+
+We define shrinkage as movement from MLE to zero. We define an estimate as shrunk if the estimate is at least 0.1 closer to zero than the MLE. We can see that ash is shinking more frequently and more severely, on average.  
+```{r, echo=F}
+#shrink statistics
+cat("number of shrunk (shrinkage>0.1) apeglm estimates\n")
+sum(shrunk)                                             
+cat("number of shrunk (shrinkage>0.1) ash estimates\n")
+sum(shrunkash)   
+cat("quantiles of shrinkage for apeglm (top) and ash (bottom) \n")
+quantile(shrink, prob=c(.5,.75,.9,.95,.975,.99,.995))   #quantiles of shrinkage
+quantile(shrinkash, prob=c(.5,.75,.9,.95,.975,.99,.995))#ash has universally greater shrinkage
+
+hist(shrink[shrink<2], ylim=c(0,500), main=NULL); title(main="histogram of shrinkage for apeglm (y-axis restricted to [0,500]")   
+plot(shrink ~ truth); title(main="shrink vs. true effect plots for apeglm")
+#hist(shrinkash[shrinkash<2], ylim=c(0,500))  
+#plot(shrinkash ~ truth)                                #very large shrink cases                  
+plot(shrink[shrink<2] ~ truth[shrink<2]); title(main = "shrink vs. true plots, y-axis restricted from 0 to 2")
+#plot(shrinkash[shrinkash<2] ~ truth[shrinkash<2])      
+#we can see that both ash and apeglm shrink estimates where true effects are close to zero
+```
+
+# improvement statistics and plots
+
+We define improvement as movement from MLE to truth. The plots show the extent and distribution of shrinkage and improvement for apeglm and ash. We can see that ash gives better estimates than apeglm on average. From the improvement histograms, we can see that ash gives improvement scores that are more extreme/hit-or-miss (which makes sense conisderring ash is giving bigger shrinkage)
+```{r, echo=F}
+#improvevement statistics
+cat("mean apeglm improvement for shrunk genes\n")
+mean(improve[shrunk])                                   
+cat("mean ash improvement for shrunk genes\n")
+mean(improveash[shrunkash])      
+cat("quantiles of improvement with shrunk genes for apeglm (top) and ash (bottom)\n")
+quantile(improve[shrunk], prob=c(0.005,0.01,0.025,0.05,0.1,0.25,.5,.75,.9,.95,.975,.99,.995)) #quantiles of improvement
+quantile(improveash[shrunkash], prob=c(0.005,0.01,0.025,0.05,0.1,0.25,.5,.75,.9,.95,.975,.99,.995)) #improvement more extreme in both directions (as greater shrinkage) with equal median, but MEAN is higher
+cat("Mean absolute error\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = TRUE)
+cat("MAE and MAD for genes shrunk by apeglm (recall we define shrunk as >0.1 shrinkage)\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunk)
+getMAD(goal = truth, mle = mle, map = map, ash = ashe, int = shrunk)
+cat("MAE and MAD for genes shrunk by ash\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunkash)
+getMAD(goal = truth, mle = mle, map = map, ash = ashe, int = shrunkash) #on average, ash has (slightly) better MAE and MAD
+
+improve2 = ifelse(improve< -1, -1.1, improve)
+improve3 = ifelse(improve2>1, 1.1, improve2)
+improveash2 = ifelse(improveash< -1, -1.1, improveash)
+improveash3 = ifelse(improveash2>1, 1.1, improveash2)
+hist(improve3[shrunk], breaks=10, main=NULL); title(main="histogram of apeglm improvement (movement from MLE to truth) for shrunk genes", xlab = "improvement (very large/small improvement changed to values of 1.1 and -1.1")                       
+hist(improveash3[shrunkash], breaks=10, main=NULL); title(main="histogram of improvement (movement from MLE to truth) for ash shrunk genes", xlab = "improvement (very large/small improvement changed to values of 1.1 and -1.1")  
+```
+
+# Interval accuracy and width
+All three estimatation procedures give confidence intervals with roughly the same width and roughly control for the specified confidence level.
+```{r, echo=F}
+#other statistics - interval accuracy and width
+truemleCI = truth>=mle-1.96*mlesd & truth<=mle+1.96*mlesd
+truemapCI = truth>=map-1.96*mapsd & truth<=map+1.96*mapsd
+trueashCI = truth>=ashe-1.96*ashsd &truth<=ashe+1.96*ashsd
+cat("proportion of times true effects were in the 95% confidence intervals for MLE, MAP and ash (in that order) \n")
+sum(truemleCI)/length(truemleCI)
+sum(truemapCI)/length(truemapCI)
+sum(trueashCI)/length(trueashCI)
+cat("summary statistics for standard errors of MLE, MAP and ash estimates (in that order) \n")
+summary(mlesd); summary(mapsd); summary(ashsd) #similar accuracy and width
+```
+
+# Filtering
+We define a gene's total counts as the sum of the gene's counts across samples. 
+
+We wish to determine the filtering rule such that the MLE is most accurate with regard to CAT plot. We look at three rules: removing genes where less than half the samples have a certain count (which we call the threshold), removing genes where less than all the samples have a certain count (threshold), and removing genes where the totl counts are less than a certain amount (threshold). For each rule, we look at various different thresholds, and calculate the "average MLE concordance" that results when filtering with that threshold. The average MLE concordance is just taking the concordance when looking at top 10 genes, top 20 genes, etc., and averaging. We chose the rule that has the best concordance, and if multiple rules have similar concordance, we chose the rule that has the smallest number of genes removed. Across all rules and thresholds, filtering out genes with total counts less than 610 is the best. Using this rule, MLE with filtering is neck-and-neck with ash in the CAT plot, and better than apeglm.
+```{r, echo=F, fig.show = 'hide', results = 'hide'}
+#looking at half samples, full samples, or total count filtering
+getFilterRule(sub, beta, 4, load=FALSE, desc="filtering rule: genes with less than this many counts for half the samples removed")
+getFilterRule(sub, beta, 8, load=FALSE, max=100, desc="filtering rule: genes with less than this many counts for all the samples removed")
+getFilterRule(sub, beta, 4, max=1000, all=TRUE, load=FALSE, desc="filtering rule: genes with less than this many total counts removed")
+
+filterRule1 = filterIt(pSub, 4, 40)
+filterRule2 = filterIt(pSub, 8, 20)
+filterRule3 = pSub$counts$total>610
+cat("number of genes remaining when filtering no genes, filtering by half samples, filtering by all samples and filtering by total counts, in that order \n")
+length(filterRule1); sum(filterRule1); sum(filterRule2); sum(filterRule3)
+conc1 = plotCat(truth = truth, mle = ifelse(filterRule1, mle, 0), map = map, ashe = ashe)$data
+conc2 = plotCat(truth = truth, mle = ifelse(filterRule2, mle, 0), map = map, ashe = ashe)$data
+conc3 = plotCat(truth = truth, mle = ifelse(filterRule3, mle, 0), map = map, ashe =  ashe)$data
+cat("mean concordance when filtering by half samples\n")
+mean(conc1$concordance[conc1$estimate=="mle"])
+cat("mean concordance when filtering by all samples\n")
+mean(conc2$concordance[conc2$estimate=="mle"])
+cat("mean concordance when filtering by gene-wide count total\n")
+mean(conc3$concordance[conc3$estimate=="mle"])
+#based on the plots, filterRule3 give the greatest concordance 
+
+mle.filter = ifelse(filterRule3, mle, 0)
+```
+ 
+```{r, echo=F}
+#CAT plot
+plotCatF(truth = truth, mle, map, ashe, mle.filter)$plot
+
+#MA and truth vs. estimate plots
+getPlots(truth,mle,map,ashe,includeAsh=TRUE, mle.filter, filterRule1, includeFilter=TRUE)
+
+#Summary statistics
+cat("Mean absolute error\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=TRUE)
+cat("MAE for apeglm-shrunk genes (shrinkage>0.1) \n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=shrunk)
+cat("MAE for ash-shrunk genes (shrinkage>0.1) \n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=shrunkash)
+cat("MAE for MLE with filtering \n")
+mean(abs(truth[filterRule1]-mle.filter[filterRule1]))
+```
+
+
+# alternate simulations
+We try simulating $\beta_i$ from $t_3/10$ so that we have mostly close-to-zero effects (but with some relatively large effects occasionally appearing).  Furthermore $\phi_i$ from $\text{Exp}(1/87)$ with probability $0.5$ and 500 with probability $0.5$. The distribution of overdispersion from the real data was approximated by a similar mixture distribution: one component was $\text{Exp}(1/196)$ with 30% proportion, and the other component was a point mass at 500 with 70% proportion. Therefore, our simulated overdispersion will lead to nosier data. 
+```{r, echo=F}
+#smaller overdispersions and t-distributed effects with smaller variance and heavier tails
+set.seed(2395)
+sub = c(2,3,5,6,14,15,20,21)
+beta = rt(nrow(p$counts), df=3)/10
+disp1 = 1+rexp(nrow(p$counts), 1/87) #empiral parameter would be 1/174
+mixProp = 0.5                        #empircal parameter would be 0.3
+phi = vector("double", nrow(p$counts))
+for (i in 1:length(phi)) phi[i] = sample(c(disp1[i], 500), prob = c(mixProp, 1-mixProp), size = 1) 
+hist(phi, xlim=c(0,500), main=NULL); title(main="histogram of simulated overdispersion")
+
+s = processSimulation(2395, sub, beta, phi)
+truth = s$truth
+mle = s$mle
+map = s$map
+ashe = s$ashe
+shrink = abs(map-mle)
+shrinkash = abs(ashe-mle)
+shrunk = abs(map-mle)>0.1
+shrunkash = abs(ashe-mle)>0.1
+improve = abs(truth-mle)-abs(truth-map)
+improveash = abs(truth-mle)-abs(truth-ashe)
+pSub=list(counts=p$counts[,c(1,sub,26)], allelecounts=p$allelecounts[,c(1,sub,26)])
+
+cat("quantiles of simulated beta\n")
+quantile(beta,probs=c(0.005,0.01,.025,.05,.1,.25,.5,.75,.9,.95,.975,.99,.995))
+
+cat("largest 20 values of beta in absolute value\n")
+-head(sort(desc(abs(beta))), 6)
+```
+
+# Filtering for alternate simulation
+In this case, no amount of filtering leads to CAT as good as apeglm and ash. Apeglm had an average concordance of close to 0.5. 
+```{r, echo=F}
+#looking at half samples, full samples, or total count filtering
+getFilterRule(sub, beta, 4, load=FALSE, desc="filtering rule: genes with less than this many counts for half the samples removed")
+getFilterRule(sub, beta, 8, load=FALSE, max=100, desc="filtering rule: genes with less than this many counts for all the samples removed")
+getFilterRule(sub, beta, 4, max=1000, all=TRUE, load=FALSE, desc="filtering rule: genes with less than this many counts combined removed")
+#no optimal filtering exists
+```
+
+
+
+# Plot for alternate simulation
+False large effects were shrunk, but one truly large effects was also incorrectly shrunk torwards zero by apeglm. Shrinkage occurs more often, more severely and across different count sizes. Again, ash has better concordance with top genes and smaller mean absolute error. 
+
+```{r, echo=F}
+plotCat(truth,mle,map,ashe)$plot
+getPlots(truth, mle, map,ashe, includeAsh = T)
+```
+
+# Summary statistics
+Quantiles of shrinkage describes the large shrinkage for this dataset. Ash and apeglm both correctly deduce that the majority of true effects are null. 
+
+```{r, echo=F}
+cat("Quantiles of apeglm shrinkage\n")
+quantile(shrink, prob=c(.5,.75,.9,.95,.975,.99,.995)) 
+cat("Quantiles of ash shrinkage\n")
+quantile(shrinkash, prob=c(.5,.75,.9,.95,.975,.99,.995))  
+cat("MAE\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = TRUE)
+cat("MAE for genes shrunk by apeglm (i.e. genes where apeglm shrinkage>0.1)\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunk)
+cat("MAE for genes shrunk by ash\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunkash)
+```
+
+# 5 vs. 5
+
+We tried simulating standard normal effects in 5 vs. 5 sampling. Output is hidden as results are the same as the 4 vs. 4 normal effects case: ash gives more shribkage, better estimates on average, and higher concordance. Filtering did not lead to universally better concordance than ash (though it beat apeglm). 
+```{r, echo=F, eval=F}
+set.seed(2395)
+sub = c(2,3,5,6,7,14,15,16,20,21)
+beta = rnorm(nrow(p$counts))
+
+#simulating data
+s = processSimulation(2395, sub, beta)
+truth = s$truth
+mle = s$mle
+map = s$map
+ashe = s$ashe
+shrink = abs(map-mle)
+shrinkash = abs(ashe-mle)
+shrunk = abs(map-mle)>0.1
+shrunkash = abs(ashe-mle)>0.1
+improve = abs(truth-mle)-abs(truth-map)
+improveash = abs(truth-mle)-abs(truth-ashe)
+pSub=list(counts=p$counts[,c(1,sub,26)], allelecounts=p$allelecounts[,c(1,sub,26)])
+
+#getting plots
+getPlots(truth, mle, map,ashe, includeAsh = T)
+plotCat(truth,mle,map,ashe)$plot
+
+#getting shrunk and improvement statistics
+cat("number of estimates shrunk by apeglm\n")
+sum(shrunk)
+cat("apeglm shrinkage quantiles\n")
+quantile(shrink, prob=c(.5,.75,.9,.95,.975,.99,.995))   
+cat("MAE\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = TRUE)
+cat("MAE for genes shrunk by apeglm (i.e. genes where apeglm shrinkage>0.1)\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunk)
+cat("MAE for genes shrunk by ash\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunkash)
+
+#finding and applying filtering rule
+getFilterRule(sub, beta, 5, load=FALSE, desc="filtering rule: genes with less than this many counts for half the samples removed")
+getFilterRule(sub, beta, 10, load=FALSE, max=100, desc="filtering rule: genes with less than this many counts for all the samples removed")
+getFilterRule(sub, beta, 5, max=1000, all=TRUE, load=FALSE, desc="filtering rule: genes with less than this many counts combined removed")
+
+filterRule1 = filterIt(pSub, 5, 30)
+filterRule2 = filterIt(pSub, 10, 10)
+filterRule3 = pSub$counts$total>590
+length(filterRule1); sum(filterRule1); sum(filterRule2); sum(filterRule3)
+conc1 = plotCat(truth = truth, mle = ifelse(filterRule1, mle, 0), map = map, ashe = ashe)$data
+conc2 = plotCat(truth = truth, mle = ifelse(filterRule2, mle, 0), map = map, ashe = ashe)$data
+conc3 = plotCat(truth = truth, mle = ifelse(filterRule3, mle, 0), map = map, ashe =  ashe)$data
+cat("mean concordance when filtering by half samples\n")
+mean(conc1$concordance[conc1$estimate=="mle"])
+mean(conc2$concordance[conc2$estimate=="mle"])
+cat("mean concordance when filtering by all samples\n")
+mean(conc3$concordance[conc3$estimate=="mle"])
+#filter rule 1 is best
+
+mle.filter = ifelse(filterRule1, mle, 0)
+plotCatF(truth = truth, mle, map, ashe, mle.filter)$plot
+getPlots(truth,mle,map,ashe,includeAsh=TRUE, mle.filter, filterRule1, includeFilter=TRUE)
+cat("Mean absolute error\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=TRUE)
+cat("MAE for apeglm shrunk \n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=shrunk)
+cat("MAE for ash shrunk \n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int=shrunkash)
+cat("MAE for filtered MLE \n")
+mean(abs(truth[filterRule1]-mle.filter[filterRule1]))
+```
+
+# 3 vs. 3
+
+We simulated standard normal effects in a 3 vs. 3 design as well. Most output is hidden as results are similar to the 4 vs. 4 normal effects case and 5 vs. 5 normal effects case. The only differences are that filtering fails to beat ash (but it still beats apelgm) and more truly large effects are incorrectly  and overly shrunk to zero by ash but not overly shrunk by apeglm. 
+```{r, echo=F, results='hide', fig.show='hide'}
+set.seed(2395)
+sub = c(2,3,5,6,14,20)
+beta = rnorm(nrow(p$counts))
+
+s = processSimulation(2395, sub, beta)
+truth = s$truth
+mle = s$mle
+map = s$map
+ashe = s$ashe
+shrink = abs(map-mle)
+shrinkash = abs(ashe-mle)
+shrunk = abs(map-mle)>0.1
+shrunkash = abs(ashe-mle)>0.1
+improve = abs(truth-mle)-abs(truth-map)
+improveash = abs(truth-mle)-abs(truth-ashe)
+pSub=list(counts=p$counts[,c(1,sub,26)], allelecounts=p$allelecounts[,c(1,sub,26)])
+
+plotCat(truth,mle,map,ashe)$plot
+getPlots(truth, mle, map,ashe, includeAsh = T)
+
+cat("number of estimates shrunk by apeglm\n")
+sum(shrunk)
+cat("apeglm shrinkage quantiles\n")
+quantile(shrink, prob=c(.5,.75,.9,.95,.975,.99,.995))   
+#list(mean = mean(shrink), sd = sd(shrink))              #mean shrinkage (with sd)
+#hist(shrink[shrink<2], ylim=c(0,500))                   #histogram of shrinkage with x-axis and y-axis restricted
+#plot(shrink ~ truth)                                    #shrink vs. truth plots
+#plot(shrink[shrink<2] ~ truth[shrink<2])
+#mean(improve[shrunk])                                   #mean improvement among the >1000 shrunk estimates
+#quantile(improve[shrunk], prob=c(0.005,0.01,0.025,0.05,0.1,0.25,.5,.75,.9,.95,.975,.99,.995)) #quantiles of improvement
+#hist(improve[shrunk & abs(improve)<=1])                 #histogram of improvements for shrunk estimates with y-axis restricted
+cat("MAE\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = TRUE)
+cat("MAE for genes shrunk by apeglm (i.e. genes where apeglm shrinkage>0.1)\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunk)
+cat("MAE for genes shrunk by ash\n")
+getMAE(goal = truth, mle = mle, map = map, ash = ashe, int = shrunkash)
+#effects were again more drastic, with several large false positives correctly shrunk torwards zero (and no super large bad shrinkage this time either). However, shrinkage still mainly occured along small estimates. 
+
+#Filtering effects
+getFilterRule(sub, beta, 3, load=FALSE, desc="filtering rule: genes with less than this many counts for half the samples removed")
+getFilterRule(sub, beta, 6, load=FALSE, max=100, desc="filtering rule: genes with less than this many counts for all the samples removed")
+getFilterRule(sub, beta, 3, max=1000, all=TRUE, load=FALSE, desc="filtering rule: genes with less than this many counts combined removed")
+
+filterRule1 = filterIt(pSub, 3, 30)
+filterRule2 = filterIt(pSub, 3, 60)
+filterRule3 = filterIt(pSub, 6, 10)
+filterRule4 = filterIt(pSub, 6, 30)
+filterRule5 = pSub$counts$total>500
+filterRule6 = pSub$counts$total>900
+length(filterRule1); sum(filterRule1); sum(filterRule2); sum(filterRule3); sum(filterRule4); sum(filterRule5); sum(filterRule6)
+conc1 = plotCat(truth = truth, mle = ifelse(filterRule1, mle, 0), map = map, ashe = ashe)$data
+conc2 = plotCat(truth = truth, mle = ifelse(filterRule2, mle, 0), map = map, ashe = ashe)$data
+conc3 = plotCat(truth = truth, mle = ifelse(filterRule3, mle, 0), map = map, ashe =  ashe)$data
+conc4 = plotCat(truth = truth, mle = ifelse(filterRule4, mle, 0), map = map, ashe = ashe)$data
+conc5 = plotCat(truth = truth, mle = ifelse(filterRule5, mle, 0), map = map, ashe = ashe)$data
+conc6 = plotCat(truth = truth, mle = ifelse(filterRule6, mle, 0), map = map, ashe =  ashe)$data
+cat("mean concordance when filtering by half samples\n")
+mean(conc1$concordance[conc1$estimate=="mle"])
+mean(conc2$concordance[conc2$estimate=="mle"])
+cat("mean concordance when filtering by all samples\n")
+mean(conc3$concordance[conc3$estimate=="mle"])
+mean(conc4$concordance[conc3$estimate=="mle"])
+cat("mean concordance when filtering by gene-wide count total\n")
+mean(conc5$concordance[conc5$estimate=="mle"])
+mean(conc6$concordance[conc6$estimate=="mle"])
+#based on the plots, filterRule6 give the greatest concordance
+
+mle.filter = ifelse(filterRule6, mle, 0)
+```
+
+```{r, echo=F}
+plotCatF(truth = truth, mle, map, ashe, mle.filter)$plot
+
+#true vs estimate plots
+includeAsh=TRUE
+includeFilter=FALSE
+plot(mle ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MLE")
+plot(map ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MAP")
+if (includeAsh==TRUE) plot(ashe ~ truth, ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, ash")
+if (includeFilter==TRUE) { plot(mle.filter[rule] ~ truth[rule], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, filter MLE") }
+
+#looking at large effects separately
+plot(mle[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MLE, large estimates only (absolute value of MLE >4)")
+plot(map[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, MAP, large MLE only (absolute value of MLE >4)")
+if (includeAsh==TRUE) { plot(ashe[abs(mle)>4 | abs(truth)>4] ~ truth[abs(mle)>4 | abs(truth)>4], ylim=c(-7,7), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, ash, large estimates only (absolute value of MLE >4)")}
+#if (includeFilter==TRUE) { plot(mle.filter[abs(mle)<4 & abs(truth)<4 & rule] ~ truth[abs(mle)<4 & abs(truth)<4 & rule], ylim=c(-4,4), xaxt="n"); abline(a=0, b=1, col="red"); axis(side=1,at = seq(-4, 4, by=0.5)); title(main="estimate v. true, filter MLE, y-range between -4 and 4") }
+
+#MA plots
+totalCounts = rowSums(cts)
+logCounts = log(totalCounts)
+plot(mle ~ logCounts, ylim=c(-7,7)); title(main="MLE vs. log of counts (for both alleles)")
+plot(map ~ logCounts, ylim=c(-7,7)); title(main="MAP vs. log of counts (for both alleles)")
+if (includeAsh==TRUE) plot(ashe ~ logCounts, ylim=c(-7,7)); title(main="ash vs. log of counts (for both alleles)")
+if (includeFilter==TRUE) { plot(mle.filter[rule] ~ logCounts[rule], ylim=c(-7,7)); title(main="filter MLE vs. log of counts (for both alleles)") }
+```
+
+
+
+
+
